@@ -31,7 +31,7 @@ import java.util.logging.Logger;
  * finishes. The planned build history import (issue #12) will call it once per build already
  * on disk, so both paths apply the same job filter and write the same data.
  */
-public final class BuildRecorder {
+final class BuildRecorder {
 
     private static final Logger LOGGER = Logger.getLogger(BuildRecorder.class.getName());
 
@@ -39,7 +39,7 @@ public final class BuildRecorder {
     }
 
     /** Records {@code run}, unless the configured job filter excludes it. */
-    public static void record(Run<?, ?> run) {
+    static void record(Run<?, ?> run) {
         DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
         String jobName = run.getParent().getFullName();
 
