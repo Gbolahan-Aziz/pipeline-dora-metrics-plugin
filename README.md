@@ -69,6 +69,8 @@ GET /dora-api/overview?days=30          All 4 DORA metrics
 GET /dora-api/pipelines?days=30&limit=10   Pipeline rankings
 GET /dora-api/trends?days=90&job=my-pipeline   Time-series trend data
 GET /dora-api/export?days=90&format=csv    CSV/JSON bulk export
+POST /dora-api/importHistory               Start a build history import (Administer)
+GET /dora-api/importStatus                 Counters for the running or last import (Administer)
 ```
 
 ## How It Works
@@ -110,8 +112,9 @@ thirty days until the import is run again. Widening a job filter has the same pr
 build that did not match when it ran was never recorded, and widening the pattern alone
 does not bring it back.
 
-Re-running is cheap. Builds already recorded are skipped, so a second run only fetches
-what is missing.
+Re-running still walks every job and loads every build inside the window; what it skips is
+the writing, for builds already recorded. So it is safe to run again, but not free, and on a
+large instance it is worth leaving to the window you actually need.
 
 An import can only read what Jenkins still has on disk. A job whose build discarder has
 already removed old builds cannot be recovered.
@@ -158,6 +161,8 @@ io.jenkins.plugins.dorametrics/
 │   └── MetricsMaintenanceTask  # Scheduled cleanup and export
 ├── ui/
 │   ├── DoraApiAction           # REST API at /dora-api/ (auth-protected)
+│   ├── BuildHistoryImporter    # Imports builds already on disk
+│   ├── HistoryImportTask       # Runs the first import, once per instance
 │   ├── DoraDashboardAction     # Dashboard UI at /dora-metrics/
 │   ├── DoraDashboardLink       # Manage Jenkins sidebar link
 │   └── JobMetricsAction        # Per-job metrics tab
@@ -168,7 +173,9 @@ io.jenkins.plugins.dorametrics/
 
 ## Security
 
-- All API endpoints require Jenkins READ permission
+- Read-only API endpoints require Jenkins READ permission
+- The build history import endpoints require Jenkins ADMINISTER, and starting an import is POST only
+- The import status returns counters only, never job names
 - Dashboard rankings filtered by Item.READ (users only see jobs they can access)
 - Export credentials managed through Jenkins Credentials plugin (encrypted, auditable)
 - SQL queries use parameterized statements (no SQL injection)

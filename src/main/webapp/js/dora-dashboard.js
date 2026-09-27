@@ -190,6 +190,9 @@ function createSparkline(id, data, color) {
     if (importBtn) {
         importBtn.addEventListener('click', startImport);
         showRememberedImportSummary();
+        // An import may already be running, started automatically or from another tab.
+        // Only asked for when the button is there, since the endpoint needs Administer.
+        checkImportOnLoad();
     }
 
     if (typeof Chart !== 'undefined') { loadCharts(30); }
@@ -209,6 +212,18 @@ function showRememberedImportSummary() {
     if (text) { setImportStatus(text); }
 }
 
+function checkImportOnLoad() {
+    var base = getBaseUrl();
+    fetch(base + '/dora-api/importStatus')
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(data) {
+            if (!data || !data.running) { return; }
+            setImportStatus(describeImport(data));
+            pollImportStatus(base);
+        })
+        .catch(function() { /* nothing useful to show */ });
+}
+
 function setImportStatus(text) {
     var el = document.getElementById('dora-import-status');
     if (el) { el.textContent = text || ''; }
@@ -216,8 +231,14 @@ function setImportStatus(text) {
 
 function describeImport(data) {
     if (!data) { return ''; }
-    if (data.running) { return 'Import running...'; }
+    if (data.running) {
+        return typeof data.recorded === 'undefined'
+            ? 'Import running...'
+            : 'Import running, ' + data.recorded + ' recorded so far...';
+    }
     if (typeof data.recorded === 'undefined') { return ''; }
+    if (data.error) { return 'Import failed: ' + data.error; }
+    if (data.completed === false) { return 'Import stopped early, ' + data.recorded + ' recorded.'; }
     var text = 'Imported ' + data.recorded + ' build' + (data.recorded === 1 ? '' : 's')
         + ' from ' + data.jobs + ' job' + (data.jobs === 1 ? '' : 's');
     if (data.skipped) { text += ', ' + data.skipped + ' skipped'; }

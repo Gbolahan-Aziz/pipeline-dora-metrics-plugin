@@ -86,6 +86,11 @@ public class DoraApiAction implements RootAction {
             json.put("skipped", last.skipped);
             json.put("failed", last.failed);
             json.put("durationMs", last.durationMs);
+            // Without these a run that stopped early, or threw, reads as an ordinary finish.
+            json.put("completed", last.completed);
+            if (last.error != null) {
+                json.put("error", last.error);
+            }
         }
         if (message != null) {
             json.put("message", message);

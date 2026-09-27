@@ -11,7 +11,13 @@ import org.junit.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
 
+import io.jenkins.plugins.dorametrics.collectors.BuildHistoryImporter;
+import net.sf.json.JSONObject;
+
 import java.net.URL;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -31,7 +37,8 @@ public class ImportEndpointsTest {
         j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
         j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy()
                 .grant(jenkins.model.Jenkins.ADMINISTER).everywhere().to("boss")
-                .grant(jenkins.model.Jenkins.READ).everywhere().to("viewer"));
+                .grant(jenkins.model.Jenkins.READ).everywhere().to("viewer")
+                .grant(jenkins.model.Jenkins.MANAGE, jenkins.model.Jenkins.READ).everywhere().to("manager"));
     }
 
     @Test
@@ -42,8 +49,16 @@ public class ImportEndpointsTest {
         WebResponse res = wc.getPage(new WebRequest(
                 new URL(j.getURL() + "dora-api/importHistory"), HttpMethod.GET)).getWebResponse();
 
-        assertTrue("GET must not be able to start an import, got " + res.getStatusCode(),
-                res.getStatusCode() == 405 || res.getStatusCode() == 404);
+        // Stapler makes a @POST method unresolvable rather than method-not-allowed, so this
+        // is a 404. Accepting 404 alone would also pass for a mistyped URL, so the same URL
+        // is posted to below and must work: that is what proves the path is right.
+        assertEquals("GET must not be able to start an import", 404, res.getStatusCode());
+
+        WebRequest post = new WebRequest(
+                new URL(j.getURL() + "dora-api/importHistory"), HttpMethod.POST);
+        wc.addCrumb(post);
+        assertEquals("and the same URL must work as a POST", 200,
+                wc.getPage(post).getWebResponse().getStatusCode());
     }
 
     @Test
@@ -83,16 +98,37 @@ public class ImportEndpointsTest {
                 res.getContentAsString().contains("running"));
     }
 
+    /**
+     * Result holds only counters, so asserting a job name is absent checks something the type
+     * already guarantees. Asserting the key set instead fails the day a field carrying names
+     * is added.
+     */
     @Test
     public void statusExposesCountersOnly() throws Exception {
         JenkinsRule.WebClient wc = j.createWebClient().login("boss");
-        j.createFreeStyleProject("a-private-job-name");
+        j.buildAndAssertSuccess(j.createFreeStyleProject("a-private-job-name"));
+
+        WebRequest start = new WebRequest(
+                new URL(j.getURL() + "dora-api/importHistory"), HttpMethod.POST);
+        wc.addCrumb(start);
+        wc.getPage(start);
+        waitForImport();
 
         String body = wc.getPage(new WebRequest(
                 new URL(j.getURL() + "dora-api/importStatus"), HttpMethod.GET))
                 .getWebResponse().getContentAsString();
 
+        assertTrue("an import must have run, so there are counters to inspect",
+                body.contains("recorded"));
         assertTrue("must not leak job names", !body.contains("a-private-job-name"));
+
+        Set<String> allowed = new HashSet<>(Arrays.asList(
+                "running", "jobs", "recorded", "skipped", "failed", "durationMs",
+                "completed", "error", "message"));
+        JSONObject json = JSONObject.fromObject(body);
+        for (Object key : json.keySet()) {
+            assertTrue("unexpected key in the status body: " + key, allowed.contains(key.toString()));
+        }
     }
 
     @Test
@@ -118,5 +154,31 @@ public class ImportEndpointsTest {
 
         assertEquals(200, res.getStatusCode());
         assertTrue("should report that it started", res.getContentAsString().contains("started"));
+
+        waitForImport(); // otherwise the run outlives this test
+    }
+
+    /** Manage sits between Read and Administer, so it is the near miss worth asserting. */
+    @Test
+    public void manageIsNotEnoughForEitherEndpoint() throws Exception {
+        JenkinsRule.WebClient wc = j.createWebClient().login("manager");
+        wc.setThrowExceptionOnFailingStatusCode(false);
+
+        WebRequest post = new WebRequest(
+                new URL(j.getURL() + "dora-api/importHistory"), HttpMethod.POST);
+        wc.addCrumb(post);
+        assertEquals("Manage must not start an import", 403,
+                wc.getPage(post).getWebResponse().getStatusCode());
+
+        assertEquals("nor read the counters", 403, wc.getPage(new WebRequest(
+                new URL(j.getURL() + "dora-api/importStatus"), HttpMethod.GET))
+                .getWebResponse().getStatusCode());
+    }
+
+    private void waitForImport() throws Exception {
+        for (int i = 0; i < 100 && BuildHistoryImporter.isRunning(); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue("the import should have finished", !BuildHistoryImporter.isRunning());
     }
 }
