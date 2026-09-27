@@ -42,13 +42,29 @@ final class BuildRecorder {
     private BuildRecorder() {
     }
 
-    /** Records {@code run}, unless the configured job filter excludes it. */
-    static void record(Run<?, ?> run) {
+    /** What {@link #record} did with a build. */
+    enum Outcome {
+        /** Stored, with its commits and, for a pipeline, its stages. */
+        RECORDED,
+        /** Left alone: the job filter excludes it, or its name no longer belongs to this job. */
+        FILTERED,
+        /** Could not be written. The store logs why. */
+        FAILED
+    }
+
+    /**
+     * Records {@code run}, unless the configured job filter excludes it.
+     *
+     * <p>Returns what happened rather than nothing, because a caller importing in bulk has
+     * to tell a build it stored from one it filtered out or failed to write, and a failed
+     * write raises no exception: the store logs it and returns a negative id.
+     */
+    static Outcome record(Run<?, ?> run) {
         DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
         String jobName = run.getParent().getFullName();
 
         if (config != null && !config.shouldTrackJob(jobName)) {
-            return;
+            return Outcome.FILTERED;
         }
 
         MetricsStore store = MetricsStore.getInstance();
@@ -71,14 +87,17 @@ final class BuildRecorder {
         if (!isStillNamed(run.getParent(), jobName)) {
             // the job was deleted or renamed since; its old name may belong to another job now
             LOGGER.fine("Not recording " + run.getFullDisplayName() + ", " + jobName + " is no longer this job");
-            return;
+            return Outcome.FILTERED;
         }
         long buildId = store.recordBuild(jobName, buildNumber, timestamp, durationMs,
                 result, triggerType, branch, stages, commits);
-        if (buildId < 0) return;
+        if (buildId < 0) {
+            return Outcome.FAILED;
+        }
 
         LOGGER.fine("Collected metrics for " + jobName + "#" + buildNumber
                 + " (" + result + ", " + durationMs + "ms)");
+        return Outcome.RECORDED;
     }
 
     /** Whether the name still resolves to this exact job, looked up as SYSTEM. */

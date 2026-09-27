@@ -73,8 +73,9 @@ public class BuildHistoryImporterTest {
         FreeStyleProject job = j.createFreeStyleProject("secret-job");
         j.buildAndAssertSuccess(job);
 
-        BuildHistoryImporter.importHistory(30);
+        BuildHistoryImporter.Result result = BuildHistoryImporter.importHistory(30);
 
+        assertEquals("a filtered build must not be counted as recorded", 0, result.recorded);
         assertTrue("an excluded job must stay excluded", stored("secret-job").isEmpty());
     }
 
@@ -191,15 +192,21 @@ public class BuildHistoryImporterTest {
         config.setExcludedJobPattern("");
         BuildHistoryImporter.importHistory(30);
 
-        long buildId = stored("restage-job").get(0).id;
-        int afterFirst = store.getStages(buildId).size();
-        assertEquals("one stage from the first import", 1, afterFirst);
+        long idAfterFirst = stored("restage-job").get(0).id;
+        int stagesAfterFirst = store.getStages(idAfterFirst).size();
+        assertEquals("one stage from the first import", 1, stagesAfterFirst);
 
         BuildHistoryImporter.importHistory(30);
 
         assertEquals("the build must not be duplicated", 1, stored("restage-job").size());
+
+        // Read the id again rather than reusing it. insertBuild replaces the row and hands
+        // out a new id, so checking stages under a freshly read id would pass while the old
+        // rows sat orphaned under the previous one.
+        long idAfterSecond = stored("restage-job").get(0).id;
+        assertEquals("the build row must not have been replaced", idAfterFirst, idAfterSecond);
         assertEquals("and its stages must not be appended to again",
-                afterFirst, store.getStages(stored("restage-job").get(0).id).size());
+                stagesAfterFirst, store.getStages(idAfterFirst).size());
     }
 
     /**

@@ -96,36 +96,55 @@ public final class BuildHistoryImporter {
 
         int jobs = 0, recorded = 0, skipped = 0, failed = 0;
 
+        DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
+
         for (Job<?, ?> job : Jenkins.get().getAllItems(Job.class)) {
+            if (shouldStop()) {
+                LOGGER.info("Build history import stopping early, Jenkins is going down");
+                break;
+            }
             jobs++;
             String jobName = job.getFullName();
 
-            // One query per job rather than one per build. Builds already stored are left
-            // alone: re-recording them would be wasted work, and insertBuild replaces the
-            // build row with a new id, which strands the stage and commit rows it had.
-            Set<Integer> alreadyStored = new HashSet<>();
-            try {
-                store.getBuilds(jobName, cutoff, startedAt + DAY_MS)
-                        .forEach(b -> alreadyStored.add(b.buildNumber));
-            } catch (Exception e) {
-                LOGGER.log(Level.FINE, "Could not read stored builds for " + jobName, e);
+            // Asking once per job rather than once per build, so a job that is filtered out
+            // never has its builds loaded at all.
+            if (config != null && !config.shouldTrackJob(jobName)) {
+                continue;
             }
 
-            for (Run<?, ?> run = job.getLastBuild(); run != null; run = run.getPreviousBuild()) {
-                if (run.getTimeInMillis() < cutoff) {
-                    break; // builds walk newest first, so everything below is older too
+            // Everything for one job is wrapped, including walking its builds. A job with an
+            // unreadable build must not end the whole run: if it did, the caller would never
+            // mark the import done and the task would walk the instance again an hour later.
+            try {
+                Set<Integer> alreadyStored = new HashSet<>();
+                store.getBuilds(jobName, cutoff, startedAt + DAY_MS)
+                        .forEach(b -> alreadyStored.add(b.buildNumber));
+
+                for (Run<?, ?> run = job.getLastBuild(); run != null; run = run.getPreviousBuild()) {
+                    if (shouldStop()) {
+                        break;
+                    }
+                    if (run.getTimeInMillis() < cutoff) {
+                        break; // builds walk newest first, so everything below is older too
+                    }
+                    if (run.isBuilding() || alreadyStored.contains(run.getNumber())) {
+                        skipped++;
+                        continue;
+                    }
+                    try {
+                        switch (BuildRecorder.record(run)) {
+                            case RECORDED -> recorded++;
+                            case FILTERED -> skipped++;
+                            case FAILED -> failed++;
+                        }
+                    } catch (Exception e) {
+                        failed++;
+                        LOGGER.log(Level.WARNING, "Could not import " + run.getFullDisplayName(), e);
+                    }
                 }
-                if (run.isBuilding() || alreadyStored.contains(run.getNumber())) {
-                    skipped++;
-                    continue;
-                }
-                try {
-                    BuildRecorder.record(run);
-                    recorded++;
-                } catch (Exception e) {
-                    failed++;
-                    LOGGER.log(Level.WARNING, "Could not import " + run.getFullDisplayName(), e);
-                }
+            } catch (Exception e) {
+                failed++;
+                LOGGER.log(Level.WARNING, "Could not import job " + jobName, e);
             }
         }
 
@@ -133,6 +152,19 @@ public final class BuildHistoryImporter {
         lastResult = result;
         LOGGER.info("Build history import finished: " + result);
         return result;
+    }
+
+    /**
+     * True once the import should give up: Jenkins is going down, or the thread it runs on
+     * was interrupted. Checked per job and per build, since a large instance can spend a
+     * long time in this loop.
+     */
+    private static boolean shouldStop() {
+        if (Thread.currentThread().isInterrupted()) {
+            return true;
+        }
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        return jenkins == null || jenkins.isTerminating();
     }
 
     /** The import window, capped at the retention window so it cannot import rows cleanup would drop. */

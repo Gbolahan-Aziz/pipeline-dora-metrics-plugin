@@ -39,6 +39,17 @@ public class HistoryImportTask extends AsyncPeriodicWork {
         return 5 * 60_000L;
     }
 
+    /**
+     * Whether a finished run counts as the import having happened.
+     *
+     * <p>A partial failure still counts: the alternative is walking the whole instance every
+     * hour because one build could not be read. A run that wrote nothing at all does not,
+     * since there is nothing to show for it and the next hour may do better.
+     */
+    static boolean shouldMarkDone(BuildHistoryImporter.Result result) {
+        return !(result.recorded == 0 && result.failed > 0);
+    }
+
     @Override
     protected void execute(TaskListener listener) {
         try {
@@ -53,9 +64,12 @@ public class HistoryImportTask extends AsyncPeriodicWork {
                 return; // an import was already running, try again next hour
             }
 
-            // Mark it done even when some builds failed: the run happened, and retrying the
-            // whole instance every hour would cost more than the few builds it missed.
-            config.setHistoryImportDone(true);
+            if (!shouldMarkDone(result)) {
+                LOGGER.warning("Build history import wrote nothing, leaving it to run again: " + result);
+                return;
+            }
+
+            config.markHistoryImportDone();
             LOGGER.info("First build history import complete: " + result);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Build history import failed", e);

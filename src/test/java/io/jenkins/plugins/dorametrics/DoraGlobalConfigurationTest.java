@@ -55,7 +55,7 @@ public class DoraGlobalConfigurationTest {
     public void historyImportDoneIsNotResetByTheForm() throws Exception {
         // The flag is not on the form. A later save of the configuration page must not
         // clear it, or the import would run again on every restart after any config change.
-        config.setHistoryImportDone(true);
+        config.markHistoryImportDone();
         j.configRoundtrip();
         assertTrue(DoraGlobalConfiguration.get().isHistoryImportDone());
     }

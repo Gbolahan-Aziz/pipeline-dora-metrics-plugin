@@ -363,7 +363,13 @@ public class DoraGlobalConfiguration extends GlobalConfiguration {
     public void setHistoryImportDays(int v) { this.historyImportDays = Math.max(1, v); }
 
     public boolean isHistoryImportDone() { return historyImportDone; }
-    public void setHistoryImportDone(boolean v) { this.historyImportDone = v; save(); }
+
+    /**
+     * Records that the first import has run. Deliberately not a setter: a bean setter
+     * makes this a configurable property, so an exported JCasC file would carry
+     * historyImportDone and a copy of it would stop a fresh instance ever importing.
+     */
+    public void markHistoryImportDone() { this.historyImportDone = true; save(); }
 
     public int getDashboardTopN() { return dashboardTopN; }
     public void setDashboardTopN(int v) { this.dashboardTopN = v; }
