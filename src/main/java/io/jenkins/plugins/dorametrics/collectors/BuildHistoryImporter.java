@@ -43,19 +43,27 @@ public final class BuildHistoryImporter {
         public final int skipped;
         public final int failed;
         public final long durationMs;
+        /**
+         * False when the run stopped before it had walked everything, so the counters
+         * describe a partial pass. Counters alone cannot say this: a run that stopped
+         * before it started looks exactly like a run that found nothing to do.
+         */
+        public final boolean completed;
 
-        Result(int jobs, int recorded, int skipped, int failed, long durationMs) {
+        Result(int jobs, int recorded, int skipped, int failed, long durationMs, boolean completed) {
             this.jobs = jobs;
             this.recorded = recorded;
             this.skipped = skipped;
             this.failed = failed;
             this.durationMs = durationMs;
+            this.completed = completed;
         }
 
         @Override
         public String toString() {
             return "jobs=" + jobs + " recorded=" + recorded
-                    + " skipped=" + skipped + " failed=" + failed + " in " + durationMs + "ms";
+                    + " skipped=" + skipped + " failed=" + failed
+                    + (completed ? "" : " (stopped early)") + " in " + durationMs + "ms";
         }
     }
 
@@ -95,12 +103,14 @@ public final class BuildHistoryImporter {
         MetricsStore store = MetricsStore.getInstance();
 
         int jobs = 0, recorded = 0, skipped = 0, failed = 0;
+        boolean completed = true;
 
         DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
 
         for (Job<?, ?> job : Jenkins.get().getAllItems(Job.class)) {
             if (shouldStop()) {
                 LOGGER.info("Build history import stopping early, Jenkins is going down");
+                completed = false;
                 break;
             }
             jobs++;
@@ -122,6 +132,7 @@ public final class BuildHistoryImporter {
 
                 for (Run<?, ?> run = job.getLastBuild(); run != null; run = run.getPreviousBuild()) {
                     if (shouldStop()) {
+                        completed = false;
                         break;
                     }
                     if (run.getTimeInMillis() < cutoff) {
@@ -148,7 +159,8 @@ public final class BuildHistoryImporter {
             }
         }
 
-        Result result = new Result(jobs, recorded, skipped, failed, System.currentTimeMillis() - startedAt);
+        Result result = new Result(jobs, recorded, skipped, failed,
+                System.currentTimeMillis() - startedAt, completed);
         lastResult = result;
         LOGGER.info("Build history import finished: " + result);
         return result;

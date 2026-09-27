@@ -83,12 +83,53 @@ public class HistoryImportTaskTest {
     @Test
     public void marksDoneOnlyWhenSomethingWasWritten() {
         assertFalse("nothing written and failures: leave it to run again",
-                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(2, 0, 0, 5, 10)));
+                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(2, 0, 0, 5, 10, true)));
 
         assertTrue("some written, some failed: the run happened",
-                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(2, 3, 0, 1, 10)));
+                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(2, 3, 0, 1, 10, true)));
 
-        assertTrue("nothing to do at all: the run happened",
-                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(2, 0, 4, 0, 10)));
+        assertTrue("nothing to do at all: the run still happened",
+                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(2, 0, 4, 0, 10, true)));
+    }
+
+    /**
+     * The case that made this necessary: interrupting the thread before the task runs makes
+     * the loop stop on its first check, so every counter is zero. Before completion was
+     * tracked the flag was set anyway and the import never happened on that instance.
+     */
+    @Test
+    public void anInterruptedRunLeavesTheFlagOff() throws Exception {
+        DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
+        config.setExcludedJobPattern("interrupted-job");
+        j.buildAndAssertSuccess(j.createFreeStyleProject("interrupted-job"));
+        config.setExcludedJobPattern("");
+
+        assertFalse("precondition", config.isHistoryImportDone());
+
+        Thread.currentThread().interrupt();
+        try {
+            task().execute(TaskListener.NULL);
+        } finally {
+            Thread.interrupted(); // clear it so the rest of the suite is unaffected
+        }
+
+        assertFalse("an interrupted run must not count as the import having happened",
+                DoraGlobalConfiguration.get().isHistoryImportDone());
+        assertEquals("and must not have imported anything", 0, storedBuilds("interrupted-job"));
+    }
+
+    /**
+     * A run that stopped because Jenkins was going down reports zero of everything, which
+     * reads exactly like a run that found nothing to import. Marking that done would mean
+     * the import never happens on that instance, so completion is tracked separately from
+     * the counters.
+     */
+    @Test
+    public void neverMarksDoneWhenTheRunDidNotFinish() {
+        assertFalse("stopped before it walked anything",
+                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(0, 0, 0, 0, 5, false)));
+
+        assertFalse("stopped part way, even having recorded plenty",
+                HistoryImportTask.shouldMarkDone(new BuildHistoryImporter.Result(3, 7, 2, 0, 5, false)));
     }
 }

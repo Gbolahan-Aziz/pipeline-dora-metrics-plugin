@@ -42,12 +42,16 @@ public class HistoryImportTask extends AsyncPeriodicWork {
     /**
      * Whether a finished run counts as the import having happened.
      *
+     * <p>A run that did not finish never counts, however healthy its counters look. One that
+     * stops on the first job because Jenkins is going down reports zero of everything, which
+     * is indistinguishable from a run that simply had nothing to import.
+     *
      * <p>A partial failure still counts: the alternative is walking the whole instance every
      * hour because one build could not be read. A run that wrote nothing at all does not,
      * since there is nothing to show for it and the next hour may do better.
      */
     static boolean shouldMarkDone(BuildHistoryImporter.Result result) {
-        return !(result.recorded == 0 && result.failed > 0);
+        return result.completed && !(result.recorded == 0 && result.failed > 0);
     }
 
     @Override
