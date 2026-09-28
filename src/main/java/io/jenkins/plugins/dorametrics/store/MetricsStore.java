@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 
 /**
  * SQLite embedded database for storing build metrics.
@@ -27,7 +28,7 @@ public class MetricsStore {
 
     private static final Set<String> ALLOWED_ORDER_BY = Set.of(
             "avg_dur DESC", "avg_dur ASC", "failures DESC", "failures ASC",
-            "total DESC", "total ASC"
+            "total DESC", "total ASC", "failure_rate DESC"
     );
 
     private final String dbUrl;
@@ -78,7 +79,35 @@ public class MetricsStore {
             stmt.execute("PRAGMA journal_mode=WAL");
             stmt.execute("PRAGMA busy_timeout=5000");
         }
+        org.sqlite.Function.create(conn, "REGEXP", new RegexpFunction());
         return conn;
+    }
+
+    /**
+     * {@code value REGEXP pattern} for SQL, with the same full-match Java regex semantics as
+     * the job filter and the MTTR calculation, so a pattern selects the same jobs everywhere.
+     * SQLite has the operator but no implementation of its own. One instance per connection,
+     * and a connection is only used by one thread, so the compiled pattern can be kept.
+     */
+    private static final class RegexpFunction extends org.sqlite.Function {
+        private String lastRegex;
+        private Pattern lastPattern;
+
+        @Override
+        protected void xFunc() throws SQLException {
+            // X REGEXP Y calls regexp(Y, X): the pattern comes first
+            String regex = value_text(0);
+            String value = value_text(1);
+            if (regex == null || value == null) {
+                result();
+                return;
+            }
+            if (!regex.equals(lastRegex)) {
+                lastPattern = Pattern.compile(regex);
+                lastRegex = regex;
+            }
+            result(lastPattern.matcher(value).matches() ? 1 : 0);
+        }
     }
 
     private void initializeSchema() {
@@ -227,6 +256,72 @@ public class MetricsStore {
         return records;
     }
 
+    /**
+     * For every job whose failures had not been fixed yet at {@code beforeMs}, when its run of
+     * failures began: the earliest FAILURE after that job's last SUCCESS before that moment.
+     * Lets a recovery inside a window be measured from a failure that started before it.
+     */
+    public java.util.Map<String, Long> failureStreaksOpenAt(long beforeMs, Set<String> excludedJobs,
+                                                             String branchPattern) {
+        java.util.Map<String, Long> starts = new java.util.HashMap<>();
+        List<String> excluded = usableNames(excludedJobs);
+        String sql = "SELECT f.job_name, MIN(f.timestamp) FROM builds f"
+                + " WHERE f.timestamp < ? AND f.result = 'FAILURE'"
+                + branchCondition("f.branch", branchPattern)
+                + " AND NOT EXISTS (SELECT 1 FROM builds s WHERE s.job_name = f.job_name"
+                + " AND s.result = 'SUCCESS' AND s.timestamp > f.timestamp AND s.timestamp < ?"
+                + branchCondition("s.branch", branchPattern) + ")"
+                + notIn("f.job_name", excluded)
+                + " GROUP BY f.job_name";
+        try (Connection conn = getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            int index = 1;
+            ps.setLong(index++, beforeMs);
+            if (branchPattern != null) {
+                ps.setString(index++, branchPattern);
+            }
+            ps.setLong(index++, beforeMs);
+            if (branchPattern != null) {
+                ps.setString(index++, branchPattern);
+            }
+            bindExcluded(ps, index, excluded);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    starts.put(rs.getString(1), rs.getLong(2));
+                }
+            }
+        } catch (SQLException e) {
+            LOGGER.log(Level.WARNING, "Failed to query open failure streaks", e);
+        }
+        return starts;
+    }
+
+    /**
+     * Builds that finished after {@code afterMs} and no later than {@code untilMs}, leaving out
+     * the given job names. A build is stored when it finishes, so this is what an export that
+     * ran at {@code afterMs} could not have seen yet, however long before that the build started.
+     */
+    public List<BuildRecord> getBuildsFinishedBetween(long afterMs, long untilMs, Set<String> excludedJobs) {
+        List<BuildRecord> records = new ArrayList<>();
+        List<String> excluded = usableNames(excludedJobs);
+        String sql = "SELECT * FROM builds WHERE timestamp + duration_ms > ? AND timestamp + duration_ms <= ?"
+                + notIn("job_name", excluded) + " ORDER BY timestamp";
+        try (Connection conn = getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, afterMs);
+            ps.setLong(2, untilMs);
+            bindExcluded(ps, 3, excluded);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    records.add(BuildRecord.fromResultSet(rs));
+                }
+            }
+        } catch (SQLException e) {
+            LOGGER.log(Level.WARNING, "Failed to query finished builds", e);
+        }
+        return records;
+    }
+
     public List<String> getAllJobNames() {
         List<String> names = new ArrayList<>();
         String sql = "SELECT DISTINCT job_name FROM builds ORDER BY job_name";
@@ -281,6 +376,47 @@ public class MetricsStore {
         return records;
     }
 
+    /**
+     * The stages of many builds at once, keyed by build id, each list in recorded order.
+     * One query per few hundred builds instead of one per build, which is what made exporting
+     * a month of history slow.
+     */
+    public java.util.Map<Long, List<StageRecord>> getStagesByBuild(java.util.Collection<Long> buildIds) {
+        java.util.Map<Long, List<StageRecord>> byBuild = new java.util.HashMap<>();
+        List<Long> ids = new ArrayList<>(buildIds);
+        try (Connection conn = getConnection()) {
+            for (int start = 0; start < ids.size(); start += STAGE_BATCH) {
+                List<Long> chunk = ids.subList(start, Math.min(ids.size(), start + STAGE_BATCH));
+                StringBuilder sql = new StringBuilder("SELECT * FROM stages WHERE build_id IN (");
+                for (int i = 0; i < chunk.size(); i++) {
+                    sql.append(i == 0 ? "?" : ",?");
+                }
+                sql.append(") ORDER BY id");
+                try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+                    for (int i = 0; i < chunk.size(); i++) {
+                        ps.setLong(i + 1, chunk.get(i));
+                    }
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            StageRecord stage = new StageRecord(
+                                    rs.getLong("id"),
+                                    rs.getLong("build_id"),
+                                    rs.getString("stage_name"),
+                                    rs.getLong("duration_ms"),
+                                    rs.getString("result"));
+                            byBuild.computeIfAbsent(stage.buildId, k -> new ArrayList<>()).add(stage);
+                        }
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            LOGGER.log(Level.WARNING, "Failed to query stages", e);
+        }
+        return byBuild;
+    }
+
+    private static final int STAGE_BATCH = 500;
+
     // === Optimized aggregate queries ===
 
     public long countSuccessfulBuilds(long fromMs, long toMs, String jobPattern) {
@@ -288,7 +424,13 @@ public class MetricsStore {
     }
 
     public long countSuccessfulBuilds(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs) {
-        return executeCount(fromMs, toMs, jobPattern, "AND result = 'SUCCESS'", excludedJobs);
+        return countSuccessfulBuilds(fromMs, toMs, jobPattern, excludedJobs, null);
+    }
+
+    /** As above, counting only builds on a branch matching {@code branchPattern}, or all when it is null. */
+    public long countSuccessfulBuilds(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs,
+                                      String branchPattern) {
+        return executeCount(fromMs, toMs, jobPattern, "AND result = 'SUCCESS'", excludedJobs, branchPattern);
     }
 
     public long countTotalBuilds(long fromMs, long toMs, String jobPattern) {
@@ -296,7 +438,23 @@ public class MetricsStore {
     }
 
     public long countTotalBuilds(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs) {
-        return executeCount(fromMs, toMs, jobPattern, "", excludedJobs);
+        return countTotalBuilds(fromMs, toMs, jobPattern, excludedJobs, null);
+    }
+
+    /** As above, counting only builds on a branch matching {@code branchPattern}, or all when it is null. */
+    public long countTotalBuilds(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs,
+                                 String branchPattern) {
+        return executeCount(fromMs, toMs, jobPattern, "", excludedJobs, branchPattern);
+    }
+
+    /**
+     * Builds that ran as a deployment, successfully or not: SUCCESS, UNSTABLE or FAILURE.
+     * An aborted build, one that was never built, or one with no result deployed nothing.
+     */
+    public long countDeployments(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs,
+                                 String branchPattern) {
+        return executeCount(fromMs, toMs, jobPattern, "AND result IN ('SUCCESS', 'UNSTABLE', 'FAILURE')",
+                excludedJobs, branchPattern);
     }
 
     public long countFailedBuilds(long fromMs, long toMs, String jobPattern) {
@@ -304,7 +462,13 @@ public class MetricsStore {
     }
 
     public long countFailedBuilds(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs) {
-        return executeCount(fromMs, toMs, jobPattern, "AND result = 'FAILURE'", excludedJobs);
+        return countFailedBuilds(fromMs, toMs, jobPattern, excludedJobs, null);
+    }
+
+    /** As above, counting only builds on a branch matching {@code branchPattern}, or all when it is null. */
+    public long countFailedBuilds(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs,
+                                  String branchPattern) {
+        return executeCount(fromMs, toMs, jobPattern, "AND result = 'FAILURE'", excludedJobs, branchPattern);
     }
 
     public double avgLeadTimeMs(long fromMs, long toMs, String jobPattern) {
@@ -312,21 +476,49 @@ public class MetricsStore {
     }
 
     public double avgLeadTimeMs(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs) {
-        boolean glob = jobPattern != null && !".*".equals(jobPattern);
+        return avgLeadTimeMs(fromMs, toMs, jobPattern, excludedJobs, null);
+    }
+
+    /** As above, over builds on a branch matching {@code branchPattern} only, or all when it is null. */
+    /**
+     * Average lead time of the successful builds in the window, as the time from the earliest
+     * commit that build deployed until it finished. A changelog only lists what changed since
+     * the build before, so a commit first built by a build that failed or was aborted is in
+     * that build's changelog, not in the deploying one's. Every build since the job's previous
+     * success therefore counts toward the next success. Only builds on a production branch
+     * take part when {@code branchPattern} is set.
+     */
+    public double avgLeadTimeMs(long fromMs, long toMs, String jobPattern, Set<String> excludedJobs,
+                                String branchPattern) {
+        boolean filtered = jobPattern != null && !".*".equals(jobPattern);
         List<String> excluded = usableNames(excludedJobs);
-        String sql = "SELECT AVG((b.timestamp + b.duration_ms) - c.min_commit) FROM builds b "
-                + "INNER JOIN (SELECT build_id, MIN(timestamp) as min_commit FROM commits GROUP BY build_id) c "
-                + "ON b.id = c.build_id "
-                + "WHERE b.timestamp BETWEEN ? AND ? AND b.result = 'SUCCESS' AND c.min_commit > 0"
-                + (glob ? " AND b.job_name GLOB ?" : "")
-                + notIn("b.job_name", excluded);
+        String sql = "WITH ordered AS ("
+                + " SELECT id, job_name, timestamp, duration_ms, result,"
+                // how many successes this job had before this build: the same for a success and
+                // every build since the success before it
+                + " COALESCE(SUM(CASE WHEN result = 'SUCCESS' THEN 1 ELSE 0 END) OVER ("
+                + " PARTITION BY job_name ORDER BY timestamp, id"
+                + " ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS deployment"
+                + " FROM builds WHERE 1 = 1" + branchCondition("branch", branchPattern) + "),"
+                + " first_commits AS ("
+                + " SELECT o.job_name, o.deployment, MIN(c.timestamp) AS first_commit"
+                + " FROM ordered o INNER JOIN commits c ON c.build_id = o.id"
+                + " WHERE c.timestamp > 0 GROUP BY o.job_name, o.deployment)"
+                + " SELECT AVG((d.timestamp + d.duration_ms) - f.first_commit) FROM ordered d"
+                + " INNER JOIN first_commits f ON f.job_name = d.job_name AND f.deployment = d.deployment"
+                + " WHERE d.result = 'SUCCESS' AND d.timestamp BETWEEN ? AND ?"
+                + (filtered ? " AND d.job_name REGEXP ?" : "")
+                + notIn("d.job_name", excluded);
         try (Connection conn = getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, fromMs);
-            ps.setLong(2, toMs);
-            int index = 3;
-            if (glob) {
-                ps.setString(index++, regexToGlob(jobPattern));
+            int index = 1;
+            if (branchPattern != null) {
+                ps.setString(index++, branchPattern);
+            }
+            ps.setLong(index++, fromMs);
+            ps.setLong(index++, toMs);
+            if (filtered) {
+                ps.setString(index++, jobPattern);
             }
             bindExcluded(ps, index, excluded);
             try (ResultSet rs = ps.executeQuery()) {
@@ -351,7 +543,8 @@ public class MetricsStore {
         List<String> excluded = usableNames(excludedJobs);
         String sql = "SELECT job_name, COUNT(*) as total, "
                 + "AVG(duration_ms) as avg_dur, "
-                + "SUM(CASE WHEN result = 'FAILURE' THEN 1 ELSE 0 END) as failures "
+                + "SUM(CASE WHEN result = 'FAILURE' THEN 1 ELSE 0 END) as failures, "
+                + "SUM(CASE WHEN result = 'FAILURE' THEN 1.0 ELSE 0 END) / COUNT(*) as failure_rate "
                 + "FROM builds WHERE timestamp BETWEEN ? AND ?"
                 + notIn("job_name", excluded)
                 + " GROUP BY job_name ORDER BY " + orderBy + " LIMIT ?";
@@ -389,7 +582,8 @@ public class MetricsStore {
         List<String> excluded = usableNames(excludedJobs);
         String sql = "SELECT s.stage_name, COUNT(*) as total, "
                 + "AVG(s.duration_ms) as avg_dur, "
-                + "SUM(CASE WHEN s.result = 'FAILURE' THEN 1 ELSE 0 END) as failures "
+                + "SUM(CASE WHEN s.result = 'FAILURE' THEN 1 ELSE 0 END) as failures, "
+                + "SUM(CASE WHEN s.result = 'FAILURE' THEN 1.0 ELSE 0 END) / COUNT(*) as failure_rate "
                 + "FROM stages s INNER JOIN builds b ON s.build_id = b.id "
                 + "WHERE b.timestamp BETWEEN ? AND ?"
                 + notIn("b.job_name", excluded)
@@ -415,11 +609,13 @@ public class MetricsStore {
         return results;
     }
 
-    private long executeCount(long fromMs, long toMs, String jobPattern, String extraWhere, Set<String> excludedJobs) {
-        boolean glob = jobPattern != null && !".*".equals(jobPattern);
+    private long executeCount(long fromMs, long toMs, String jobPattern, String extraWhere,
+                              Set<String> excludedJobs, String branchPattern) {
+        boolean filtered = jobPattern != null && !".*".equals(jobPattern);
         List<String> excluded = usableNames(excludedJobs);
         String sql = "SELECT COUNT(*) FROM builds WHERE timestamp BETWEEN ? AND ?"
-                + (glob ? " AND job_name GLOB ?" : "")
+                + (filtered ? " AND job_name REGEXP ?" : "")
+                + branchCondition("branch", branchPattern)
                 + " " + extraWhere
                 + notIn("job_name", excluded);
         try (Connection conn = getConnection();
@@ -427,8 +623,11 @@ public class MetricsStore {
             ps.setLong(1, fromMs);
             ps.setLong(2, toMs);
             int index = 3;
-            if (glob) {
-                ps.setString(index++, regexToGlob(jobPattern));
+            if (filtered) {
+                ps.setString(index++, jobPattern);
+            }
+            if (branchPattern != null) {
+                ps.setString(index++, branchPattern);
             }
             bindExcluded(ps, index, excluded);
             try (ResultSet rs = ps.executeQuery()) {
@@ -438,6 +637,25 @@ public class MetricsStore {
             LOGGER.log(Level.FINE, "Count query failed", e);
         }
         return 0;
+    }
+
+    /**
+     * SQL fragment keeping builds whose branch matches the pattern, with one bind variable for
+     * it. A build with no branch is kept: nothing says it came from a branch that is not
+     * production, and a deploy job without SCM has none. Empty when there is no pattern.
+     */
+    private static String branchCondition(String column, String branchPattern) {
+        if (branchPattern == null) return "";
+        return " AND (" + column + " IS NULL OR " + column + " = '' OR " + column + " REGEXP ?)";
+    }
+
+    /**
+     * Whether a build's branch passes the same test as {@link #branchCondition}, for the
+     * metrics that are worked out row by row.
+     */
+    public static boolean isOnBranch(BuildRecord build, String branchPattern) {
+        return branchPattern == null || build.branch == null || build.branch.isEmpty()
+                || build.branch.matches(branchPattern);
     }
 
     /**

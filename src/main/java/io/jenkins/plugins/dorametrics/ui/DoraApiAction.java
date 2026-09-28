@@ -20,6 +20,7 @@ import org.kohsuke.stapler.verb.GET;
 
 import java.util.Calendar;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
@@ -70,9 +71,10 @@ public class DoraApiAction implements RootAction {
         PipelineRanker ranker = new PipelineRanker();
         Jenkins jenkins = Jenkins.get();
         JSONObject json = new JSONObject();
-        json.put("slowest", rankingsToJson(filterVisible(ranker.slowestPipelines(fromMs, toMs, limit), jenkins)));
-        json.put("most_failing", rankingsToJson(filterVisible(ranker.mostFailingPipelines(fromMs, toMs, limit), jenkins)));
-        json.put("flakiest", rankingsToJson(filterVisible(ranker.flakiestPipelines(fromMs, toMs, limit), jenkins)));
+        // Ranked in full and cut after filtering, so filtered rows do not take slots
+        json.put("slowest", rankingsToJson(topVisible(ranker.slowestPipelines(fromMs, toMs, Integer.MAX_VALUE), jenkins, limit)));
+        json.put("most_failing", rankingsToJson(topVisible(ranker.mostFailingPipelines(fromMs, toMs, Integer.MAX_VALUE), jenkins, limit)));
+        json.put("flakiest", rankingsToJson(topVisible(ranker.flakiestPipelines(fromMs, toMs, Integer.MAX_VALUE), jenkins, limit)));
 
         return new org.kohsuke.stapler.json.JsonHttpResponse(json, 200);
     }
@@ -100,7 +102,7 @@ public class DoraApiAction implements RootAction {
                 .collect(Collectors.groupingBy(b -> {
                     Calendar cal = Calendar.getInstance();
                     cal.setTimeInMillis(b.timestamp);
-                    return String.format("%d-%02d-%02d",
+                    return String.format(Locale.ROOT, "%d-%02d-%02d",
                             cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH));
                 }));
 
@@ -139,10 +141,11 @@ public class DoraApiAction implements RootAction {
             StringBuilder csv = new StringBuilder();
             csv.append("job_name,build_number,timestamp,duration_ms,result,trigger_type,branch\n");
             for (BuildRecord b : builds) {
-                csv.append(String.format("%s,%d,%d,%d,%s,%s,%s\n",
+                // a plain \n on every platform, so the export does not depend on the controller's OS
+                csv.append(String.format(Locale.ROOT, "%s,%d,%d,%d,%s,%s,%s",
                         escapeCsv(b.jobName), b.buildNumber, b.timestamp, b.durationMs,
                         escapeCsv(b.result), escapeCsv(b.triggerType),
-                        escapeCsv(b.branch != null ? b.branch : "")));
+                        escapeCsv(b.branch != null ? b.branch : ""))).append('\n');
             }
             final String csvStr = csv.toString();
             return new org.kohsuke.stapler.HttpResponse() {
@@ -184,10 +187,15 @@ public class DoraApiAction implements RootAction {
         if (value.length() > 0 && "=+-@\t\r".indexOf(value.charAt(0)) >= 0) {
             value = "'" + value;
         }
-        if (value.contains(",") || value.contains("\"") || value.contains("\n") || value.contains("\r")) {
+        // A semicolon is a separator too for spreadsheets in many locales
+        if (value.contains(",") || value.contains(";") || value.contains("\"") || value.contains("\n") || value.contains("\r")) {
             return "\"" + value.replace("\"", "\"\"") + "\"";
         }
         return value;
+    }
+
+    private static List<RankedPipeline> topVisible(List<RankedPipeline> pipelines, Jenkins jenkins, int limit) {
+        return filterVisible(pipelines, jenkins).stream().limit(limit).collect(Collectors.toList());
     }
 
     private static List<RankedPipeline> filterVisible(List<RankedPipeline> pipelines, Jenkins jenkins) {
@@ -205,9 +213,13 @@ public class DoraApiAction implements RootAction {
         }
     }
 
+    /**
+     * Every tracked job. The job settings, folders included, are already applied through
+     * the excluded set every calculator is built with, so filtering again by the production
+     * pattern alone would drop the jobs that only a production folder brings in.
+     */
     private String getPattern() {
-        DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
-        return config != null ? config.getProductionJobPattern() : ".*";
+        return ".*";
     }
 
     static JSONObject metricToJson(DoraMetric m) {

@@ -19,6 +19,7 @@ import java.util.Set;
 public final class JobVisibility {
 
     private static final String REQUEST_CACHE = JobVisibility.class.getName() + ".hidden";
+    private static final String EXCLUDED_CACHE = JobVisibility.class.getName() + ".excluded";
 
     private JobVisibility() {
     }
@@ -84,19 +85,46 @@ public final class JobVisibility {
     }
 
     /**
-     * Everything to leave out of what the current user is shown: disabled
-     * pipelines when that option is on, plus jobs the user may not see.
+     * Everything the job settings leave out for everyone: jobs the job filters do not
+     * track, and disabled pipelines when that option is on.
+     */
+    public static Set<String> excludedForEveryone(DoraGlobalConfiguration config, MetricsStore store) {
+        // One dashboard page builds a calculator or ranker for every card and list, so work
+        // this out once per request, as with the jobs hidden from the user.
+        StaplerRequest2 req = Stapler.getCurrentRequest2();
+        if (req != null) {
+            Object cached = req.getAttribute(EXCLUDED_CACHE);
+            if (cached instanceof Set) {
+                @SuppressWarnings("unchecked")
+                Set<String> excluded = (Set<String>) cached;
+                return excluded;
+            }
+        }
+        Set<String> untracked = JobFilter.untracked(config, store);
+        Set<String> disabled = DisabledPipelines.names(config, store);
+        Set<String> all = new HashSet<>(untracked);
+        all.addAll(disabled);
+        Set<String> excluded = Collections.unmodifiableSet(all);
+        if (req != null) {
+            req.setAttribute(EXCLUDED_CACHE, excluded);
+        }
+        return excluded;
+    }
+
+    /**
+     * Everything to leave out of what the current user is shown: what the job
+     * settings leave out for everyone, plus jobs the user may not see.
      */
     public static Set<String> excludedForCurrentUser(DoraGlobalConfiguration config, MetricsStore store) {
-        Set<String> disabled = DisabledPipelines.names(config, store);
+        Set<String> excluded = excludedForEveryone(config, store);
         Set<String> hidden = hiddenFromCurrentUser(store);
         if (hidden.isEmpty()) {
-            return disabled;
+            return excluded;
         }
-        if (disabled.isEmpty()) {
+        if (excluded.isEmpty()) {
             return hidden;
         }
-        Set<String> all = new HashSet<>(disabled);
+        Set<String> all = new HashSet<>(excluded);
         all.addAll(hidden);
         return all;
     }

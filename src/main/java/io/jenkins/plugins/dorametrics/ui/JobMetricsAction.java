@@ -82,8 +82,10 @@ public class JobMetricsAction implements Action {
     public List<RankedStage> getSlowestStages() {
         Map<String, List<Long>> stageDurations = new LinkedHashMap<>();
 
+        Map<Long, List<MetricsStore.StageRecord>> stagesByBuild = MetricsStore.getInstance().getStagesByBuild(
+                getBuilds().stream().map(b -> b.id).collect(java.util.stream.Collectors.toList()));
         for (BuildRecord build : getBuilds()) {
-            for (MetricsStore.StageRecord stage : MetricsStore.getInstance().getStages(build.id)) {
+            for (MetricsStore.StageRecord stage : stagesByBuild.getOrDefault(build.id, Collections.emptyList())) {
                 stageDurations.computeIfAbsent(stage.stageName, k -> new ArrayList<>())
                         .add(stage.durationMs);
             }
@@ -124,8 +126,16 @@ public class JobMetricsAction implements Action {
         @Override
         public Class<Job> type() { return Job.class; }
 
+        /**
+         * Only jobs the settings track get the tab. For any other job nothing is recorded, and
+         * a page of zeros and N/A would read as if it were being measured.
+         */
         @Override
         public Collection<? extends Action> createFor(Job target) {
+            DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
+            if (config != null && !config.shouldTrackJob(target.getFullName())) {
+                return Collections.emptySet();
+            }
             return Collections.singleton(new JobMetricsAction(target));
         }
     }
