@@ -297,4 +297,33 @@ public class BuildHistoryImporterTest {
                 result.toString(), BuildHistoryImporter.getLastResult().toString());
         assertTrue("the flag must be cleared when the run ends", !BuildHistoryImporter.isRunning());
     }
+
+    /**
+     * An import run from the dashboard has to set the flag as well. Without it the automatic
+     * task still walks the whole instance later, for history that has already been imported
+     * by hand.
+     */
+    @Test
+    public void anOnDemandRunMarksTheImportDone() throws Exception {
+        FreeStyleProject job = j.createFreeStyleProject("on-demand-job");
+        j.buildAndAssertSuccess(job);
+
+        DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
+        assertNotNull(config);
+        assertTrue("nothing has marked it yet", !config.isHistoryImportDone());
+
+        assertTrue("the import should have started", BuildHistoryImporter.startAsync(30));
+        waitForTheImportToFinish();
+
+        assertTrue("an on demand run that stored something marks the import done",
+                config.isHistoryImportDone());
+    }
+
+    /** The flag is set before the slot is released, so this does not race it. */
+    private void waitForTheImportToFinish() throws Exception {
+        for (int i = 0; i < 100 && BuildHistoryImporter.isRunning(); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue("the import should have finished", !BuildHistoryImporter.isRunning());
+    }
 }
