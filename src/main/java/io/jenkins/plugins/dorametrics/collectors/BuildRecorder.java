@@ -60,19 +60,22 @@ final class BuildRecorder {
         String triggerType = getTriggerType(run);
         String branch = getBranch(run);
 
+        // Gathered before anything is written, so the build and everything belonging to it
+        // go in as one transaction. Writing the build first and its children afterwards is
+        // what let a re-record strand the old ones.
+        List<MetricsStore.CommitRow> commits = collectCommitData(run);
+        List<MetricsStore.StageRow> stages = run instanceof WorkflowRun
+                ? collectStageData((WorkflowRun) run)
+                : Collections.emptyList();
+
         if (!isStillNamed(run.getParent(), jobName)) {
             // the job was deleted or renamed since; its old name may belong to another job now
             LOGGER.fine("Not recording " + run.getFullDisplayName() + ", " + jobName + " is no longer this job");
             return;
         }
-        long buildId = store.insertBuild(jobName, buildNumber, timestamp, durationMs, result, triggerType, branch);
+        long buildId = store.recordBuild(jobName, buildNumber, timestamp, durationMs,
+                result, triggerType, branch, stages, commits);
         if (buildId < 0) return;
-
-        collectCommitData(run, buildId, store);
-
-        if (run instanceof WorkflowRun) {
-            collectStageData((WorkflowRun) run, buildId, store);
-        }
 
         LOGGER.fine("Collected metrics for " + jobName + "#" + buildNumber
                 + " (" + result + ", " + durationMs + "ms)");
@@ -85,17 +88,31 @@ final class BuildRecorder {
         }
     }
 
-    private static void collectCommitData(Run<?, ?> run, long buildId, MetricsStore store) {
+    private static List<MetricsStore.CommitRow> collectCommitData(Run<?, ?> run) {
+        List<MetricsStore.CommitRow> commits = new ArrayList<>();
+        int withoutId = 0;
         try {
             for (ChangeLogSet<? extends ChangeLogSet.Entry> changeSet : getChangeSets(run)) {
                 for (ChangeLogSet.Entry entry : changeSet) {
-                    store.insertCommit(buildId, entry.getCommitId(),
-                            entry.getAuthor().getFullName(), entry.getTimestamp());
+                    // Not every SCM gives an entry an id, and commit_sha is NOT NULL. The entry
+                    // is dropped on its own rather than taking the whole build's write with it.
+                    String commitId = entry.getCommitId();
+                    if (commitId == null) {
+                        withoutId++;
+                        continue;
+                    }
+                    commits.add(new MetricsStore.CommitRow(commitId,
+                            entry.getAuthor().getFullName(), entry.getTimestamp()));
                 }
             }
         } catch (Exception e) {
             LOGGER.log(Level.FINE, "Could not collect commit data for " + run.getFullDisplayName(), e);
         }
+        if (withoutId > 0) {
+            LOGGER.fine("Skipped " + withoutId + " change log entries without a commit id for "
+                    + run.getFullDisplayName());
+        }
+        return commits;
     }
 
     private static List<ChangeLogSet<? extends ChangeLogSet.Entry>> getChangeSets(Run<?, ?> run) {
@@ -105,10 +122,11 @@ final class BuildRecorder {
         return Collections.emptyList();
     }
 
-    private static void collectStageData(WorkflowRun run, long buildId, MetricsStore store) {
+    private static List<MetricsStore.StageRow> collectStageData(WorkflowRun run) {
+        List<MetricsStore.StageRow> stages = new ArrayList<>();
         try {
             FlowExecution execution = run.getExecution();
-            if (execution == null) return;
+            if (execution == null) return stages;
 
             DepthFirstScanner scanner = new DepthFirstScanner();
             List<FlowNode> allNodes = new ArrayList<>();
@@ -134,13 +152,15 @@ final class BuildRecorder {
                 long duration = Math.max(0, endTiming.getStartTime() - startTiming.getStartTime());
                 boolean hasError = endNode.getAction(ErrorAction.class) != null;
 
-                store.insertStage(buildId, label.getDisplayName(), duration, hasError ? "FAILURE" : "SUCCESS");
+                stages.add(new MetricsStore.StageRow(label.getDisplayName(), duration,
+                        hasError ? "FAILURE" : "SUCCESS"));
             }
 
-            LOGGER.fine("Collected " + stageEnds.size() + " stages for " + run.getFullDisplayName());
+            LOGGER.fine("Collected " + stages.size() + " stages for " + run.getFullDisplayName());
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Could not collect stage data for " + run.getFullDisplayName(), e);
         }
+        return stages;
     }
 
     /** A stage step or a branch of a parallel step, as opposed to a step that only carries a label. */

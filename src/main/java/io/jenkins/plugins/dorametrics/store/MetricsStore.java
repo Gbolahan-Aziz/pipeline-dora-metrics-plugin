@@ -156,29 +156,166 @@ public class MetricsStore {
 
     // === Write operations ===
 
-    public long insertBuild(String jobName, int buildNumber, long timestamp,
-                            long durationMs, String result, String triggerType, String branch) {
-        String sql = "INSERT OR REPLACE INTO builds (job_name, build_number, timestamp, duration_ms, result, trigger_type, branch) "
-                + "VALUES (?, ?, ?, ?, ?, ?, ?)";
-        try (Connection conn = getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, jobName);
-            ps.setInt(2, buildNumber);
-            ps.setLong(3, timestamp);
-            ps.setLong(4, durationMs);
-            ps.setString(5, result);
-            ps.setString(6, triggerType);
-            ps.setString(7, branch);
-            ps.executeUpdate();
-            try (ResultSet rs = ps.getGeneratedKeys()) {
-                if (rs.next()) {
-                    return rs.getLong(1);
+    /** A stage to write alongside its build. */
+    public static final class StageRow {
+        final String name;
+        final long durationMs;
+        final String result;
+
+        public StageRow(String name, long durationMs, String result) {
+            this.name = name;
+            this.durationMs = durationMs;
+            this.result = result;
+        }
+    }
+
+    /** A commit to write alongside its build. */
+    public static final class CommitRow {
+        final String sha;
+        final String author;
+        final long timestamp;
+
+        public CommitRow(String sha, String author, long timestamp) {
+            this.sha = sha;
+            this.author = author;
+            this.timestamp = timestamp;
+        }
+    }
+
+    /**
+     * Writes one build and the stages and commits belonging to it, in a single transaction.
+     *
+     * <p>The build row is upserted rather than replaced. INSERT OR REPLACE deletes the
+     * conflicting row and inserts a new one, which hands out a new id, and since the foreign
+     * keys on stages and commits are not enforced their old rows are left pointing at an id
+     * that no longer exists. Nothing deletes those afterwards, including retention, which
+     * looks its children up through their parent. Keeping the id and replacing the children
+     * explicitly is what stops them accumulating.
+     *
+     * <p>The id comes from RETURNING because getGeneratedKeys reports 0 after an upsert that
+     * updates rather than inserts.
+     *
+     * @return the build's id, or -1 if nothing was written
+     */
+    public long recordBuild(String jobName, int buildNumber, long timestamp,
+                            long durationMs, String result, String triggerType, String branch,
+                            List<StageRow> stages, List<CommitRow> commits) {
+        String upsert = "INSERT INTO builds "
+                + "(job_name, build_number, timestamp, duration_ms, result, trigger_type, branch) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                + "ON CONFLICT(job_name, build_number) DO UPDATE SET "
+                + "timestamp = excluded.timestamp, duration_ms = excluded.duration_ms, "
+                + "result = excluded.result, trigger_type = excluded.trigger_type, "
+                + "branch = excluded.branch "
+                + "RETURNING id";
+
+        Connection conn = null;
+        try {
+            conn = getConnection();
+            conn.setAutoCommit(false);
+            long buildId;
+
+            try (PreparedStatement ps = conn.prepareStatement(upsert)) {
+                ps.setString(1, jobName);
+                ps.setInt(2, buildNumber);
+                ps.setLong(3, timestamp);
+                ps.setLong(4, durationMs);
+                ps.setString(5, result);
+                ps.setString(6, triggerType);
+                ps.setString(7, branch);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        conn.rollback();
+                        LOGGER.log(Level.WARNING, "No id returned for " + jobName + "#" + buildNumber);
+                        return -1;
+                    }
+                    buildId = rs.getLong(1);
                 }
             }
+
+            // Replace rather than add to: this build may have been recorded before.
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM stages WHERE build_id = ?")) {
+                ps.setLong(1, buildId);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM commits WHERE build_id = ?")) {
+                ps.setLong(1, buildId);
+                ps.executeUpdate();
+            }
+
+            if (stages != null && !stages.isEmpty()) {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO stages (build_id, stage_name, duration_ms, result) VALUES (?, ?, ?, ?)")) {
+                    for (StageRow stage : stages) {
+                        ps.setLong(1, buildId);
+                        ps.setString(2, stage.name);
+                        ps.setLong(3, stage.durationMs);
+                        ps.setString(4, stage.result);
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+            }
+            if (commits != null && !commits.isEmpty()) {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO commits (build_id, commit_sha, author, timestamp) VALUES (?, ?, ?, ?)")) {
+                    for (CommitRow commit : commits) {
+                        ps.setLong(1, buildId);
+                        ps.setString(2, commit.sha);
+                        ps.setString(3, commit.author);
+                        ps.setLong(4, commit.timestamp);
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+            }
+
+            conn.commit();
+            return buildId;
         } catch (SQLException e) {
-            LOGGER.log(Level.WARNING, "Failed to insert build: " + jobName + "#" + buildNumber, e);
+            rollbackQuietly(conn);
+            LOGGER.log(Level.WARNING, "Failed to record build: " + jobName + "#" + buildNumber, e);
+            return -1;
+        } finally {
+            closeQuietly(conn);
         }
-        return -1;
+    }
+
+    /**
+     * Upserts the build row and clears the stages and commits recorded against it, returning
+     * its id so they can be written back.
+     *
+     * <p>Prefer {@link #recordBuild} where the stages and commits are already known: it writes
+     * all three in one transaction, so the build is never briefly left without them.
+     *
+     * @return the build's id, or -1 if nothing was written
+     */
+    public long insertBuild(String jobName, int buildNumber, long timestamp,
+                            long durationMs, String result, String triggerType, String branch) {
+        return recordBuild(jobName, buildNumber, timestamp, durationMs, result, triggerType, branch,
+                Collections.emptyList(), Collections.emptyList());
+    }
+
+    private static void rollbackQuietly(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.rollback();
+        } catch (SQLException e) {
+            LOGGER.log(Level.FINE, "Could not roll back", e);
+        }
+    }
+
+    private static void closeQuietly(Connection conn) {
+        if (conn == null) {
+            return;
+        }
+        try {
+            conn.close();
+        } catch (SQLException e) {
+            LOGGER.log(Level.FINE, "Could not close the connection", e);
+        }
     }
 
     public void insertStage(long buildId, String stageName, long durationMs, String result) {
@@ -840,6 +977,21 @@ public class MetricsStore {
                 ps.setLong(1, retainAfterTimestamp);
                 ps.executeUpdate();
             }
+
+            // Rows whose build is gone entirely. Retention looks children up through their
+            // parent, so anything orphaned by an older version of this plugin was never
+            // reachable and would sit there for good.
+            try (Statement stmt = conn.createStatement()) {
+                int stages = stmt.executeUpdate(
+                        "DELETE FROM stages WHERE build_id NOT IN (SELECT id FROM builds)");
+                int commits = stmt.executeUpdate(
+                        "DELETE FROM commits WHERE build_id NOT IN (SELECT id FROM builds)");
+                if (stages > 0 || commits > 0) {
+                    LOGGER.info("Pipeline DORA Metrics: removed " + stages + " orphaned stage rows and "
+                            + commits + " orphaned commit rows");
+                }
+            }
+
             LOGGER.info("Pipeline DORA Metrics: old data cleaned up");
         } catch (SQLException e) {
             LOGGER.log(Level.WARNING, "Failed to cleanup old metrics", e);
