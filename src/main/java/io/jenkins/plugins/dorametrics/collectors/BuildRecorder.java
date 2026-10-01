@@ -90,15 +90,27 @@ final class BuildRecorder {
 
     private static List<MetricsStore.CommitRow> collectCommitData(Run<?, ?> run) {
         List<MetricsStore.CommitRow> commits = new ArrayList<>();
+        int withoutId = 0;
         try {
             for (ChangeLogSet<? extends ChangeLogSet.Entry> changeSet : getChangeSets(run)) {
                 for (ChangeLogSet.Entry entry : changeSet) {
-                    commits.add(new MetricsStore.CommitRow(entry.getCommitId(),
+                    // Not every SCM gives an entry an id, and commit_sha is NOT NULL. The entry
+                    // is dropped on its own rather than taking the whole build's write with it.
+                    String commitId = entry.getCommitId();
+                    if (commitId == null) {
+                        withoutId++;
+                        continue;
+                    }
+                    commits.add(new MetricsStore.CommitRow(commitId,
                             entry.getAuthor().getFullName(), entry.getTimestamp()));
                 }
             }
         } catch (Exception e) {
             LOGGER.log(Level.FINE, "Could not collect commit data for " + run.getFullDisplayName(), e);
+        }
+        if (withoutId > 0) {
+            LOGGER.fine("Skipped " + withoutId + " change log entries without a commit id for "
+                    + run.getFullDisplayName());
         }
         return commits;
     }
