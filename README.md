@@ -146,6 +146,8 @@ so on an instance that has been collecting for a while the run finds little to d
 io.jenkins.plugins.dorametrics/
 ├── collectors/
 │   ├── BuildDataCollector      # RunListener - captures builds, stages, commits
+│   ├── BuildHistoryImporter    # Imports builds already on disk
+│   ├── HistoryImportTask       # Runs the first import, once per instance
 │   └── JobRenameListener       # ItemListener - tracks job renames/moves
 ├── dora/
 │   └── DoraCalculator          # Computes all 4 DORA metrics (SQL-optimized)
@@ -161,8 +163,6 @@ io.jenkins.plugins.dorametrics/
 │   └── MetricsMaintenanceTask  # Scheduled cleanup and export
 ├── ui/
 │   ├── DoraApiAction           # REST API at /dora-api/ (auth-protected)
-│   ├── BuildHistoryImporter    # Imports builds already on disk
-│   ├── HistoryImportTask       # Runs the first import, once per instance
 │   ├── DoraDashboardAction     # Dashboard UI at /dora-metrics/
 │   ├── DoraDashboardLink       # Manage Jenkins sidebar link
 │   └── JobMetricsAction        # Per-job metrics tab
