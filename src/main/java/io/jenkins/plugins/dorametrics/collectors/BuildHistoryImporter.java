@@ -1,0 +1,191 @@
+package io.jenkins.plugins.dorametrics.collectors;
+
+import hudson.model.Job;
+import hudson.model.Run;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
+import io.jenkins.plugins.dorametrics.DoraGlobalConfiguration;
+import io.jenkins.plugins.dorametrics.store.MetricsStore;
+import jenkins.model.Jenkins;
+
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Imports builds that are already on disk, for instances where the plugin was installed
+ * after the builds ran, or where a job did not match the filters at the time.
+ *
+ * <p>Each build is handed to {@link BuildRecorder#record(Run)}, the same entry point the
+ * listener uses, so imported builds get the same filter, commit and stage handling as
+ * builds recorded as they complete.
+ *
+ * <p>Only one import runs at a time. A second caller is told the import is already
+ * running rather than being allowed to double the work.
+ */
+public final class BuildHistoryImporter {
+
+    private static final Logger LOGGER = Logger.getLogger(BuildHistoryImporter.class.getName());
+    private static final long DAY_MS = 86_400_000L;
+
+    private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
+    private static volatile Result lastResult;
+
+    private BuildHistoryImporter() {
+    }
+
+    /** Counters for one import run. */
+    public static final class Result {
+        public final int jobs;
+        public final int recorded;
+        public final int skipped;
+        public final int failed;
+        public final long durationMs;
+        /**
+         * False when the run stopped before it had walked everything, so the counters
+         * describe a partial pass. Counters alone cannot say this: a run that stopped
+         * before it started looks exactly like a run that found nothing to do.
+         */
+        public final boolean completed;
+
+        Result(int jobs, int recorded, int skipped, int failed, long durationMs, boolean completed) {
+            this.jobs = jobs;
+            this.recorded = recorded;
+            this.skipped = skipped;
+            this.failed = failed;
+            this.durationMs = durationMs;
+            this.completed = completed;
+        }
+
+        @Override
+        public String toString() {
+            return "jobs=" + jobs + " recorded=" + recorded
+                    + " skipped=" + skipped + " failed=" + failed
+                    + (completed ? "" : " (stopped early)") + " in " + durationMs + "ms";
+        }
+    }
+
+    /** True while an import is running. */
+    public static boolean isRunning() {
+        return RUNNING.get();
+    }
+
+    /** Counters from the most recent completed import, or null if none has run. */
+    public static Result getLastResult() {
+        return lastResult;
+    }
+
+    /**
+     * Imports every build newer than {@code days} days that is not already stored.
+     *
+     * @return the counters, or null if an import was already running
+     */
+    public static Result importHistory(int days) {
+        if (!RUNNING.compareAndSet(false, true)) {
+            LOGGER.info("Build history import already running, ignoring this request");
+            return null;
+        }
+        try {
+            // The importer reads every job, including ones the requesting user cannot see.
+            try (ACLContext ignored = ACL.as2(ACL.SYSTEM2)) {
+                return run(days);
+            }
+        } finally {
+            RUNNING.set(false);
+        }
+    }
+
+    private static Result run(int days) {
+        long startedAt = System.currentTimeMillis();
+        long cutoff = startedAt - (Math.max(1, (long) days) * DAY_MS);
+        MetricsStore store = MetricsStore.getInstance();
+
+        int jobs = 0, recorded = 0, skipped = 0, failed = 0;
+        boolean completed = true;
+
+        DoraGlobalConfiguration config = DoraGlobalConfiguration.get();
+
+        for (Job<?, ?> job : Jenkins.get().getAllItems(Job.class)) {
+            if (shouldStop()) {
+                LOGGER.info("Build history import stopping early, Jenkins is going down");
+                completed = false;
+                break;
+            }
+            jobs++;
+            String jobName = job.getFullName();
+
+            // Asking once per job rather than once per build, so a job that is filtered out
+            // never has its builds loaded at all.
+            if (config != null && !config.shouldTrackJob(jobName)) {
+                continue;
+            }
+
+            // Everything for one job is wrapped, including walking its builds. A job with an
+            // unreadable build must not end the whole run: if it did, the caller would never
+            // mark the import done and the task would walk the instance again an hour later.
+            try {
+                Set<Integer> alreadyStored = new HashSet<>();
+                store.getBuilds(jobName, cutoff, startedAt + DAY_MS)
+                        .forEach(b -> alreadyStored.add(b.buildNumber));
+
+                for (Run<?, ?> run = job.getLastBuild(); run != null; run = run.getPreviousBuild()) {
+                    if (shouldStop()) {
+                        completed = false;
+                        break;
+                    }
+                    if (run.getTimeInMillis() < cutoff) {
+                        break; // builds walk newest first, so everything below is older too
+                    }
+                    if (run.isBuilding() || alreadyStored.contains(run.getNumber())) {
+                        skipped++;
+                        continue;
+                    }
+                    try {
+                        switch (BuildRecorder.record(run)) {
+                            case RECORDED -> recorded++;
+                            case FILTERED -> skipped++;
+                            case FAILED -> failed++;
+                        }
+                    } catch (Exception e) {
+                        failed++;
+                        LOGGER.log(Level.WARNING, "Could not import " + run.getFullDisplayName(), e);
+                    }
+                }
+            } catch (Exception e) {
+                failed++;
+                LOGGER.log(Level.WARNING, "Could not import job " + jobName, e);
+            }
+        }
+
+        Result result = new Result(jobs, recorded, skipped, failed,
+                System.currentTimeMillis() - startedAt, completed);
+        lastResult = result;
+        LOGGER.info("Build history import finished: " + result);
+        return result;
+    }
+
+    /**
+     * True once the import should give up: Jenkins is going down, or the thread it runs on
+     * was interrupted. Checked per job and per build, since a large instance can spend a
+     * long time in this loop.
+     */
+    private static boolean shouldStop() {
+        if (Thread.currentThread().isInterrupted()) {
+            return true;
+        }
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        return jenkins == null || jenkins.isTerminating();
+    }
+
+    /** The import window, capped at the retention window so it cannot import rows cleanup would drop. */
+    public static int resolveDays(DoraGlobalConfiguration config) {
+        if (config == null) {
+            return 30;
+        }
+        int days = Math.max(1, config.getHistoryImportDays());
+        int retention = config.getRetentionDays();
+        return retention > 0 ? Math.min(days, retention) : days;
+    }
+}
